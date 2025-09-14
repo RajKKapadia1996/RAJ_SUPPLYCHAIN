@@ -1,174 +1,200 @@
-import time
-from pathlib import Path
+# app.py
+# The Fresh Connection – Dashboard (R1 & R2)
+# Works with "Dashboard_Metrics_R1_R2_only.xlsx"
+# - Handles both: sheets split by round (e.g., KPI_R1/KPI_R2) OR
+#   a single sheet with a Round column (values like 1, 1.0, R1, "Round 1", etc.)
+
+import os
+import re
+from typing import Dict, List, Optional
+
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
 # ---------- Page setup ----------
-st.set_page_config(page_title="TFC Dashboard", layout="wide")
+st.set_page_config(
+    page_title="The Fresh Connection – Dashboard (R1 & R2)",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-DATA_PATH = Path(__file__).parent / "Dashboard_Metrics_R1_R2_only.xlsx"
+st.title("The Fresh Connection – Dashboard (R1 & R2)")
 
-# ---------- Utilities ----------
-def small_timer(msg: str):
-    """Simple context timer to spot slow spots in logs."""
-    class _T:
-        def __enter__(self): self.t0 = time.perf_counter()
-        def __exit__(self, *exc):
-            st.session_state.setdefault("_timings", []).append(
-                f"{msg}: {(time.perf_counter() - self.t0)*1000:.1f} ms"
-            )
-    return _T()
+DATA_FILE = "Dashboard_Metrics_R1_R2_only.xlsx"
 
-def optimize_df(df: pd.DataFrame) -> pd.DataFrame:
-    # Downcast numerics and use categorical for low-cardinality text
-    for c in df.select_dtypes(include="number").columns:
-        df[c] = pd.to_numeric(df[c], downcast="float")
-    for c in df.select_dtypes(include="object").columns:
-        if df[c].nunique() <= max(8, len(df)//20):
-            df[c] = df[c].astype("category")
-    return df
+# ---------- Helpers: robust round token ----------
+def _norm_round_token(x) -> Optional[str]:
+    """
+    Normalize any input (1, 1.0, 'R1', 'Round 1', etc.) to 'R#'.
+    Returns None if no digits are found.
+    """
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    s = str(x).strip().upper()
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return None
+    return f"R{int(m.group(1))}"
 
-# ---------- Cached IO & transforms ----------
-@st.cache_data(show_spinner=False, ttl=3600)
-def load_all_sheets(xlsx_path: Path) -> dict[str, pd.DataFrame]:
-    with small_timer("read_excel(all)"):
-        # Load every sheet once; keep as dict
-        sheets = pd.read_excel(xlsx_path, sheet_name=None, engine="openpyxl")
-    # Light optimization
-    return {k: optimize_df(v) for k, v in sheets.items()}
+# ---------- Data loading ----------
+@st.cache_data(show_spinner=True)
+def load_sheets(path: str) -> Dict[str, pd.DataFrame]:
+    if not os.path.exists(path):
+        st.error(f"Data file not found: {path}")
+        return {}
+    # Keep original dtypes; we’ll normalize 'Round' with _norm_round_token
+    return pd.read_excel(path, sheet_name=None, engine="openpyxl")
 
 @st.cache_data(show_spinner=False)
-def list_rounds(sheets: dict[str, pd.DataFrame]) -> list[str]:
-    # Infer rounds from sheet names like "..._R1", "..._R2" or a "Round" column
-    # Works with either layout. Falls back to ["R1", "R2"].
+def list_rounds(sheets: Dict[str, pd.DataFrame]) -> List[str]:
+    """
+    Collect available rounds from sheet names and/or a 'Round' column,
+    and return a sorted list like ['R1', 'R2'].
+    """
     rs = set()
-    for name, df in sheets.items():
-        for token in ("R1", "R2"):
-            if token in name:
-                rs.add(token)
-        if "Round" in df.columns:
-            rs.update(df["Round"].astype(str).unique())
-    if rs:
-        return sorted(rs, key=lambda r: int(r.strip("R")))
-    return ["R1", "R2"]
+
+    # 1) Try to read round info from sheet names
+    for name in sheets:
+        tok = _norm_round_token(name)
+        if tok:
+            rs.add(tok)
+
+    # 2) Try to read round info from any 'Round' column
+    for df in sheets.values():
+        if isinstance(df, pd.DataFrame) and "Round" in df.columns:
+            for v in df["Round"].unique():
+                tok = _norm_round_token(v)
+                if tok:
+                    rs.add(tok)
+
+    if not rs:
+        # Safe fallback for the assignment context
+        return ["R1", "R2"]
+
+    # Sort numerically by the digits within 'R#'
+    return sorted(rs, key=lambda t: int(re.search(r"\d+", t).group(0)))
+
+def _find_first_sheet_with_keywords(sheets: Dict[str, pd.DataFrame], keywords: List[str]) -> Optional[str]:
+    """
+    Return the first sheet name that contains ALL keywords (case-insensitive).
+    """
+    kl = [k.lower() for k in keywords]
+    for name in sheets:
+        low = name.lower()
+        if all(k in low for k in kl):
+            return name
+    return None
 
 @st.cache_data(show_spinner=False)
-def build_views(sheets: dict[str, pd.DataFrame], round_sel: str) -> dict[str, pd.DataFrame]:
+def build_views(sheets: Dict[str, pd.DataFrame], round_sel: str) -> Dict[str, pd.DataFrame]:
     """
-    Return small, ready-to-plot tables for the chosen round only.
-    This function isolates the minimal data you need per section.
+    Returns a dict of DataFrames filtered to the selected round for each area:
+    KPI, Purchasing, Operations, Sales, Supply Chain, Finance.
+    Handles:
+      - Sheet per round (e.g., 'KPI_R1') OR
+      - Single sheet with a 'Round' column
     """
-    out: dict[str, pd.DataFrame] = {}
+    out: Dict[str, pd.DataFrame] = {}
+    rtoken = _norm_round_token(round_sel)
 
-    # Try to be resilient to sheet names – lookups by substring:
-    def find_sheet(keywords: list[str]):
-        for name in sheets:
-            name_low = name.lower()
-            if all(k in name_low for k in keywords):
-                return sheets[name]
+    def get_df(area_name: str, area_keywords: List[str]) -> Optional[pd.DataFrame]:
+        # Prefer a sheet that also explicitly contains the round token
+        name_with_round = _find_first_sheet_with_keywords(sheets, area_keywords + [round_sel])
+        if name_with_round:
+            return sheets[name_with_round].copy()
+
+        # Fallback to a generic area sheet
+        generic_name = _find_first_sheet_with_keywords(sheets, area_keywords)
+        if generic_name:
+            df = sheets[generic_name].copy()
+            # If it has a 'Round' column, filter it
+            if "Round" in df.columns:
+                norm_col = df["Round"].map(_norm_round_token)
+                df = df[norm_col == rtoken]
+            return df
+
         return None
 
-    # KPIs
-    kpi_df = find_sheet(["kpi", round_sel.lower()]) or find_sheet(["kpi"])
-    if kpi_df is not None:
-        df = kpi_df.copy()
-        if "Round" in df.columns:
-            df = df[df["Round"].astype(str).eq(round_sel)]
-        out["KPI"] = df
+    out["KPI"] = get_df("KPI", ["kpi"])
+    out["Purchasing"] = get_df("Purchasing", ["purchasing"])
+    out["Operations"] = get_df("Operations", ["operations"])
+    out["Sales"] = get_df("Sales", ["sales"])
+    out["Supply Chain"] = get_df("Supply Chain", ["supply", "chain"])
+    out["Finance"] = get_df("Finance", ["finance"])
 
-    # Purchasing
-    pur_df = find_sheet(["purchasing", round_sel.lower()]) or find_sheet(["purchasing"])
-    if pur_df is not None:
-        df = pur_df.copy()
-        if "Round" in df.columns:
-            df = df[df["Round"].astype(str).eq(round_sel)]
-        out["Purchasing"] = df
-
-    # Operations
-    ops_df = find_sheet(["operations", round_sel.lower()]) or find_sheet(["operations"])
-    if ops_df is not None:
-        df = ops_df.copy()
-        if "Round" in df.columns:
-            df = df[df["Round"].astype(str).eq(round_sel)]
-        out["Operations"] = df
-
-    # Sales
-    sales_df = find_sheet(["sales", round_sel.lower()]) or find_sheet(["sales"])
-    if sales_df is not None:
-        df = sales_df.copy()
-        if "Round" in df.columns:
-            df = df[df["Round"].astype(str).eq(round_sel)]
-        out["Sales"] = df
-
-    # Supply Chain
-    sc_df = find_sheet(["supply", "chain", round_sel.lower()]) or find_sheet(["supply", "chain"])
-    if sc_df is not None:
-        df = sc_df.copy()
-        if "Round" in df.columns:
-            df = df[df["Round"].astype(str).eq(round_sel)]
-        out["Supply Chain"] = df
-
-    # Finance
-    fin_df = find_sheet(["finance", round_sel.lower()]) or find_sheet(["finance"])
-    if fin_df is not None:
-        df = fin_df.copy()
-        if "Round" in df.columns:
-            df = df[df["Round"].astype(str).eq(round_sel)]
-        out["Finance"] = df
+    # Strip unnamed columns that sometimes appear when exporting to Excel
+    for k, df in list(out.items()):
+        if df is None:
+            continue
+        drop_cols = [c for c in df.columns if str(c).lower().startswith("unnamed")]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
+        out[k] = df
 
     return out
 
-# ---------- UI ----------
-st.title("The Fresh Connection – Dashboard (R1 & R2)")
+# ---------- Simple visualization helpers ----------
+def _try_number(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
 
-# File check with friendly error
-if not DATA_PATH.exists():
-    st.error(f"Excel file not found: `{DATA_PATH.name}`. "
-             "Confirm the filename in the repo matches exactly.")
-    st.stop()
-
-with st.spinner("Loading metrics... (cached)"):
-    sheets_dict = load_all_sheets(DATA_PATH)
-    rounds = list_rounds(sheets_dict)
-
-colL, colR = st.columns([1, 3], gap="large")
-with colL:
-    round_sel = st.radio("Round", options=rounds, index=len(rounds)-1, horizontal=True)
-    section = st.selectbox("Section", ["KPI", "Purchasing", "Operations", "Sales", "Supply Chain", "Finance"])
-
-    # Debug timings (optional)
-    if "_timings" in st.session_state and st.toggle("Show load timings", value=False):
-        st.code("\n".join(st.session_state["_timings"]))
-
-with colR:
-    views = build_views(sheets_dict, round_sel)
-    df = views.get(section)
+def show_table_and_quick_charts(title: str, df: Optional[pd.DataFrame]):
+    st.subheader(title)
     if df is None or df.empty:
-        st.info(f"No data found for **{section}** in **{round_sel}**.")
-    else:
-        st.subheader(f"{section} — {round_sel}")
+        st.info("No data found for this section (for the selected round).")
+        return
 
-        # Try to pick smart defaults for quick visual
-        numeric_cols = df.select_dtypes(include="number").columns.tolist()
-        text_cols = df.select_dtypes(exclude="number").columns.tolist()
+    st.dataframe(df, use_container_width=True)
 
-        # 1) KPI cards if we see common KPI fields
-        kpi_like = [c for c in numeric_cols if any(k in c.lower() for k in ["roi", "margin", "service", "obsolete", "penalty"])]
-        if kpi_like:
-            kpi_like = kpi_like[:3]
-            cks = st.columns(len(kpi_like))
-            for i, c in enumerate(kpi_like):
-                with c:
-                    st.metric(label=c, value=f"{df[c].iloc[0]:,.2f}" if len(df) else "—")
+    # Try very gentle visualizations if the shape looks reasonable
+    with st.expander("Quick charts", expanded=False):
+        # Case 1: Metric/Value wide table
+        metric_cols = [c for c in df.columns if str(c).strip().lower() in ["metric", "kpi", "name"]]
+        value_cols = [c for c in df.columns if str(c).strip().lower() in ["value", "amount", "score"]]
+        if metric_cols and value_cols:
+            mcol = metric_cols[0]
+            vcol = value_cols[0]
+            # Only keep numeric values
+            tmp = df[[mcol, vcol]].copy()
+            tmp[vcol] = tmp[vcol].map(_try_number)
+            tmp = tmp.dropna(subset=[vcol])
+            if not tmp.empty:
+                fig = px.bar(tmp, x=mcol, y=vcol, title=f"{title} – {vcol}", text_auto=".2s")
+                fig.update_layout(xaxis_title="", yaxis_title="")
+                st.plotly_chart(fig, use_container_width=True)
+                return  # one good chart is enough
 
-        # 2) Quick chart: pick first text as x, first numeric as y
-        if text_cols and numeric_cols:
-            x, y = text_cols[0], numeric_cols[0]
-            fig = px.bar(df, x=x, y=y, title=f"{y} by {x}", height=380)
-            fig.update_layout(margin=dict(l=10, r=10, t=40, b=10))
+        # Case 2: If there is a 'Category'/'Subcategory' + numeric column
+        cat_cols = [c for c in df.columns if df[c].dtype == "object"]
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if cat_cols and num_cols:
+            fig = px.bar(df, x=cat_cols[0], y=num_cols[0], title=f"{title} – {num_cols[0]}", text_auto=".2s")
+            fig.update_layout(xaxis_title="", yaxis_title="")
             st.plotly_chart(fig, use_container_width=True)
 
-        # 3) Table
-        st.dataframe(df, use_container_width=True, height=420)
+# ---------- Main UI ----------
+with st.sidebar:
+    st.header("Controls")
+    sheets_dict = load_sheets(DATA_FILE)
+    rounds = list_rounds(sheets_dict)
+    round_sel = st.radio("Select Round", rounds, index=0, horizontal=True)
+    st.caption(f"Data file: `{DATA_FILE}`")
+
+views = build_views(sheets_dict, round_sel)
+
+# Tabs for sections
+tabs = st.tabs(["KPI", "Purchasing", "Operations", "Sales", "Supply Chain", "Finance"])
+sections = ["KPI", "Purchasing", "Operations", "Sales", "Supply Chain", "Finance"]
+
+for tab, name in zip(tabs, sections):
+    with tab:
+        show_table_and_quick_charts(name, views.get(name))
+
+st.markdown("---")
+st.caption("Tip: If your Excel layout changes, this app will still try to adapt. "
+           "If a section shows 'No data', check the sheet names or ensure a 'Round' column exists.")
+
 
